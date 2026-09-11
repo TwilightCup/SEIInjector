@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<!--
+  SEIInjector field-test on-screen UTC clock.
+
+  Display a large, high-contrast, NTP-referenced UTC clock with millisecond
+  resolution as an OBS "Browser" source on every test machine. Because each
+  streamer's OS clock is NTP-synced, this clock reads essentially the same
+  wall-clock instant on every machine. When two captured streams are aligned
+  frame-by-frame (by the SEI realtime_us), their pictures must show the same
+  HH:MM:SS.mmm — that is the visual proof of cross-machine frame lock.
+
+  Use:
+    - Serve this file (e.g. `python3 -m http.server 8081`) and point each
+      OBS "Browser" source at http://localhost:8081/test-clock.html, OR
+    - open it via file:// in the senders' browsers (it needs no network).
+  Set the OBS Browser source to full canvas, 1920x1080, 60 caps.
+
+  Options (URL query args):
+    ?zone=utc        clock timezone; default "utc". Use an IANA name for a
+                     local region if you prefer.
+    ?tick=on         render a 1ms sweep bar; on by default. Helps confirm that
+                     each frozen captured frame is a genuinely distinct instant.
+    ?ratio=0.18      text size relative to viewport width.
+-->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { height: 100%; margin: 0; background: #000; overflow: hidden; }
+  #wrap { height: 100%; display: flex; flex-direction: column;
+          align-items: center; justify-content: center; gap: 1rem; font-family: "SF Mono", "JetBrains Mono", "Consolas", monospace; color: #fff; }
+  #clock { font-size: clamp(20px, 30vh, 300px); font-weight: 700; line-height: 1;
+           letter-spacing: .02em; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #label { font-size: clamp(10px, 3vh, 30px); color: #6a8;
+            letter-spacing: .4em; text-transform: uppercase; }
+  #sweep { width: 100%; height: 1.5vh; background: #000; border-top: 1px solid #333; }
+  #sweep .fill { height: 100%; width: 0%; background: #3f6; transition: width 1ms linear; }
+  #msec { color: #7cf; }
+  body.nosync #label, body.nosync #clock { color: #f77; } /* reserved for external flag */
+</style>
+<div id="wrap">
+  <div id="label">UTC &#9651; Test Clock</div>
+  <div id="clock"></div>
+  <div id="sweep"><div class="fill" id="fill"></div></div>
+</div>
+<script>
+  const q = new URLSearchParams(location.search);
+  const tz  = q.get('zone') || 'utc';
+  const tick = q.get('tick') !== 'off';
+  const clock = document.getElementById('clock');
+  const fill  = document.getElementById('fill');
+  // Render every animation frame so the browser-source capture sees a smooth
+  // ms sweep; mmm jumps by ~1 per displayed frame at 60fps capture.
+  function frame(){
+    const d = new Date();
+    let s;
+    const us = d.getTime();
+    // HH:MM:SS.mmm in the chosen zone
+    if (tz === 'utc') {
+      const h = String(d.getUTCHours()).padStart(2,'0');
+      const m = String(d.getUTCMinutes()).padStart(2,'0');
+      const sec = String(d.getUTCSeconds()).padStart(2,'0');
+      const ms = String(d.getUTCMilliseconds()).padStart(3,'0');
+      s = `${h}:${m}:${sec}.<span id="msec">${ms}</span>`;
+    } else {
+      const p = new Intl.DateTimeFormat('en-GB', { timeZone: tz,
+            hour:'2-digit',minute:'2-digit',second:'2-digit',
+            hour12:false}).formatToParts(d);
+      const part = x => p.find(o=>o.type===x).value;
+      const ms = String(d.getMilliseconds()).padStart(3,'0');
+      s = `${part('hour')}:${part('minute')}:${part('second')}.<span id="msec">${ms}</span>`;
+    }
+    clock.innerHTML = s;
+    if (tick) fill.style.width = (us % 1000) / 10 + '%';
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+</script>

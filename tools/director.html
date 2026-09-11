@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<!--
+  SEIInjector - minimal director view (demo).
+  Subscribes to the SEI gateway, decodes each player's H.264 AU with WebCodecs,
+  buffers frames, and presents them frame-locked by a single "global alignment
+  timestamp" (gts):
+
+    gts0 = max( first realtime_us of each stream ) + LEAD   // LEAD 领先量, 默认 30s
+    gts(t)= gts0 + (performance.now(t) - performance.now(t0))// 按本机单调时钟增长
+
+  Each rAF, every stream draws its newest frame with realtime_us <= gts, so no
+  future frame is ever shown and all players advance in lock-step. The top bar
+  shows the live cross-stream frame-time difference so alignment is verifiable
+  at a glance.
+
+  Usage:  http://HOST:PORT/director.html?ws=ws://HOST:8765&streams=player_A,player_B
+          &lead=10&lag=2000   (serve with: python3 -m http.server 8080)
+-->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SEIInjector director (demo)</title>
+<style>
+  body { font-family: ui-monospace, Menlo, Consolas, monospace; background:#0e0e12; color:#dfe; margin:0; }
+  #bar { display:flex; gap:24px; align-items:baseline; padding:10px 16px; flex-wrap:wrap; }
+  #gts { font-size:18px; color:#7cf; }
+  #diff { font-size:13px; color:#fc7; }
+  #grid { display:flex; flex-direction:column; align-items:center; gap:10px; padding:0 16px 12px; }
+  .cam { position:relative; }
+  .cam canvas { background:#000; width:1280px; max-width:100%; }
+  .cam .lbl { position:absolute; top:4px; left:6px; background:#000c; padding:2px 6px; font-size:12px; }
+  .cam .lag { position:absolute; bottom:4px; left:6px; background:#a00c; padding:2px 6px; font-size:12px; display:none; }
+</style>
+<div id="bar">
+  <span id="gts">gts: waiting for both streams…</span>
+  <span id="diff">&nbsp;</span>
+</div>
+<div id="stats" style="font:12px monospace;padding:0 16px 4px;color:#9ab;white-space:pre-wrap"></div>
+<div id="grid"></div>
+
+<script>
+const QP  = new URLSearchParams(location.search);
+const WS_URL = QP.get('ws')     || 'ws://127.0.0.1:8765';
+const STREAMS = (QP.get('streams') || 'player_A,player_B').split(',').map(s=>s.trim()).filter(Boolean);
+const LEAD = Math.max(parseFloat(QP.get('lead') || '30') || 30, 30);  // 秒, gts 领先量(最小 30s)
+const LAG  = parseInt(QP.get('lag')   || '2000', 10);  // ms, 该流过旧告警线
+const ACCEL = parseFloat(QP.get('accel') || '15') || 15;  // 秒, 2x 时要冲抵的差异(默认15)
+const CACHE = parseFloat(QP.get('cache') || '30') || 30;  // 秒, 各路保有缓存>=此值才启2x(默认30)
+const FPS  = parseInt(QP.get('fps')   || '30', 10);    // 仅状态显示
+
+// ---- per-stream state ----
+const S = {};
+STREAMS.forEach(name => {
+  const card = document.createElement('div'); card.className='cam';
+  card.innerHTML = `<canvas></canvas><span class="lbl">${name}<span class="lag">&#9888;LAG</span></span>`;
+  document.querySelector('#grid').appendChild(card);
+  const cv = card.querySelector('canvas');
+  S[name] = { canvas:cv, ctx:cv.getContext('2d'),
+              cfg:null, decoder:null, q:[], firstRt:null, needKey:true,
+              lastPaintedRt:null, lagEl:card.querySelector('.lag') };
+});
+
+// visible live stats (console is polluted by browser extensions)
+const ST = {ws:'—'};
+STREAMS.forEach(n => ST[n]={cfg:0,au:0,dec:0,err:0,drawn:0});
+function renderStats(){
+  const el=document.getElementById('stats');
+  let t='WS:'+ST.ws;
+  STREAMS.forEach(n=>{ const s=S[n];
+    t+=`   ${n}: cfg=${ST[n].cfg} au=${ST[n].au} dec=${ST[n].dec} err=${ST[n].err} drawn=${ST[n].drawn}${s.firstRt?` rt=${(s.firstRt/1e6).toFixed(1)}`:' rt=-'}`;
+  });
+  el.textContent=t;
+}
+setInterval(renderStats, 500);
+
+// ---- gts (supports 2x fast-forward to burn surplus buffer) ----
+const gts = { started:false, gts0:0, lastMs:0, consumedUs:0, fast:false, fastLeftUs:0 };
+function gtsNow(){ return gts.started ? gts.gts0 + gts.consumedUs : 0; }
+function maybeStartGts(){
+  if (gts.started) return;
+  if (!STREAMS.some(n => S[n].firstRt > 0)) return;   // start once ANY stream has a frame
+  const rts = STREAMS.map(n => S[n].firstRt).filter(v => v > 0);
+  gts.gts0 = Math.max(...rts) + LEAD*1e6;            // 慢流起点+lead
+  gts.lastMs = performance.now(); gts.consumedUs = 0; gts.started = true;
+  document.querySelector('#gts').textContent = 'gts active (lead ' + LEAD + 's)';
+}
+
+// ---- decoded frame -> queue ----
+function onDecoded(name, vf){
+  if(ST[name]) ST[name].dec++;
+  const st = S[name];
+  if (!st.firstRt || vf.timestamp < st.firstRt) st.firstRt = vf.timestamp;
+  if (st.canvas.width !== vf.displayWidth){
+    st.canvas.width = vf.displayWidth; st.canvas.height = vf.displayHeight;
+  }
+  const i = st.q.findIndex(f => f.rt > vf.timestamp);
+  (i < 0) ? st.q.push({rt:vf.timestamp, vf}) : st.q.splice(i,0,{rt:vf.timestamp, vf});
+  while (st.q.length > 36000){ const f=st.q.shift(); try{f.vf.close();}catch(_){} }  // cap ~10 min @60fps safety bound (drain keeps steady-state ≈ lead+lag)
+  maybeStartGts();
+}
+
+// ---- present loop (clean: draw newest frame with rt <= gts) ----
+const _paintAt={};   // per-stream: [rtJustShown, lastPaintPerfMs]
+const _frameMs = FPS>0 ? 1000/FPS : 33;
+const PRESENT_LAG_US = 250e3;   // present ~250ms behind wall: both streams can
+                                // satisfy this from the 10s buffer, so their
+                                // rt-differences collapse to <= 1 frame.
+function present(){
+  if (!gts.started){ requestAnimationFrame(present); return; }
+  const nowMs = performance.now();
+  const dt = Math.max(0, nowMs - gts.lastMs); gts.lastMs = nowMs;
+  gts.consumedUs += dt * 1000 * (gts.fast ? 2 : 1);   // 2x fast: gts 双速推进
+  const G = gtsNow();
+  document.querySelector('#gts').textContent = 'gts ' + (G/1e6).toFixed(3) + 's'
+    + (gts.fast ? '  [2x FAST]' : '');
+  const wallNow = G - LEAD*1e6;      // gts leads wall time by LEAD
+  const P0 = wallNow - PRESENT_LAG_US;               // base shared presentation time
+  // 前提: gts 领先最慢流 >=30s; 且两路各自对呈现点都还保有 >=30s 缓存 → 开启 2x
+  const cushion = n => { const st=S[n]; return (st.q.length?st.q[st.q.length-1].rt:0) - P0; };
+  if (!gts.fast){
+    if (STREAMS.length && STREAMS.every(n => cushion(n) >= CACHE*1e6)){
+      gts.fast = true; gts.fastLeftUs = ACCEL*1e6;    // 以 2x 冲抵 ACCEL 秒差异
+    }
+  }
+  if (gts.fast){
+    gts.fastLeftUs -= dt * 1000;                       // 每墙秒少吃 1s(2x 相对 1x 的盈余)
+    if (gts.fastLeftUs <= 0 || STREAMS.some(n => cushion(n) < 0)){
+      gts.fast = false; gts.fastLeftUs = 0;            // 吃完差异或某路缓存耗尽 → 停
+    }
+  }
+  // 呈现点 P 不得超前于最慢那路流的最新缓存帧，否则 2x 会把慢流甩干(冻结+delta 跳高)
+  let headMin = Infinity;
+  for (const n of STREAMS){ const st=S[n]; if (st.q.length) headMin = Math.min(headMin, st.q[st.q.length-1].rt); }
+  const P = (headMin === Infinity) ? P0 : Math.min(P0, headMin - 250e3);
+  let maxRev=-1e18, minRev=1e18, any=false;
+  STREAMS.forEach(name => {
+    const st = S[name];
+    let pick=null;
+    for (let i=st.q.length-1;i>=0;i--){ if (st.q[i].rt <= P){ pick=st.q[i]; break; } }
+    st.lagEl.style.display = (!pick || pick.rt < P - LAG*1e3) ? 'block':'none';
+    // pace: only advance at source-frame cadence, hold last frame in between.
+    // (WebCodecs output is bursty; redrawing "newest" every rAF skips => stutter.)
+    const pa = _paintAt[name] || (_paintAt[name]={rt:-1, ms:0, drawn:false});
+    const minI = _frameMs*0.9/(gts.fast?2:1);          // 2x 时按两倍节律抽帧
+    if (pick && (pick.rt !== pa.rt) && (nowMs - pa.ms >= minI)){
+      st.ctx.drawImage(pick.vf, 0, 0, st.canvas.width, st.canvas.height);
+      if(ST[name]) ST[name].drawn++;
+      st.lastPaintedRt = pick.rt;
+      pa.rt = pick.rt; pa.ms = nowMs;
+    }
+    if (pick){
+      const floor = Math.max(st.lastPaintedRt||0, pick.rt);
+      while (st.q.length && st.q[0].rt < floor){
+        const f=st.q.shift(); try{f.vf.close();}catch(_){}
+      }
+      maxRev=Math.max(maxRev,pick.rt); minRev=Math.min(minRev,pick.rt); any=true;
+    }
+  });
+  document.querySelector('#diff').textContent = any
+    ? `|Δstream| ${((maxRev-minRev)/1000).toFixed(0)}ms  (目标 ≤${(1000/FPS)|0}ms  @ ${FPS}fps)`
+    : '等待解码…';
+  requestAnimationFrame(present);
+}
+
+// ---- WebSocket (single, clean) ----
+let ws = null;
+function connect(){
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = 'arraybuffer';
+ws.onopen  = () => { ST.ws='open'; ws.send(JSON.stringify({type:'subscribe', streams:STREAMS})); };
+ws.onerror = () => document.querySelector('#diff').textContent = 'WS error';
+ws.onclose = () => {
+    ST.ws='closed'; document.querySelector('#diff').textContent='WS closed, reconnecting…';
+    // drop per-stream state so we re-acquire fresh frames + a fresh gts
+    STREAMS.forEach(n=>{ const s=S[n]; if(s){
+      try{ if(s.decoder){ s.decoder.close(); } }catch(_){}
+      s.decoder=null; s.needKey=true; s.q=[]; s.firstRt=null; s.lastPaintedRt=null; } });
+    gts.started=false; gts.consumedUs=0; gts.fast=false; gts.fastLeftUs=0;
+    setTimeout(connect, 1500);
+  };
+ws.onmessage = (e) => {
+  if (typeof e.data === 'string'){
+    const m = JSON.parse(e.data);
+    if (m.t === 'cfg' && S[m.s]) { S[m.s].cfg = m; if(ST[m.s]) ST[m.s].cfg++; }
+    // 'tick' ignored; local monotonic clock drives gts
+    return;
+  }
+  // binary AU: [u32 hlen][header json][payload]
+  const dv = new DataView(e.data), hlen = dv.getUint32(0);
+  if (hlen <= 0 || hlen > e.data.byteLength - 4) return;   // not a valid AU frame
+  const header = JSON.parse(new TextDecoder().decode(new Uint8Array(e.data,4,hlen)));
+  if (header.t !== 'au') return;
+  const remain = e.data.byteLength - (4+hlen);
+  const sz = Math.min(header.sz || 0, remain);   // clamp so a bogus size can't RangeError
+  if (sz <= 0) return;
+  const st = S[header.s]; if (!st || header.rt <= 0) return;  // 等 SEI
+  if(ST[header.s]) ST[header.s].au++;
+  // WebCodecs must start from a keyframe: drop delta frames until one arrives.
+  if (st.needKey){ if (!header.k) return; st.needKey = false; }
+  if (!st.decoder){
+    if (!st.cfg) return;                              // 等 cfg(SPS/PPS)
+    // Annex-B in-band: NO description (keyframes carry SPS/PPS). Passing avcC
+    // description + annexb frames makes Chrome fail with "Decoder error".
+    const opts = { codec: st.cfg.codec, avc:{format:'annexb'}, optimizeForLatency:true };
+    try{ st.decoder = new VideoDecoder({
+      output: vf => onDecoded(header.s, vf),
+      error:  er => { console.error(`[${header.s}] decode`, er); st.lagEl.style.display='block'; if(ST[header.s]) ST[header.s].err++;
+        // decoder errored -> it is closed; rebuild on the next keyframe
+        st.decoder = null; st.needKey = true; }
+    }); st.decoder.configure(opts); }
+    catch(err){ console.error(`[${header.s}] configure`, err); if(ST[header.s]) ST[header.s].err++; st.decoder=null; st.needKey=true; return; }
+  }
+  try{
+    const chunk = new EncodedVideoChunk({ type: header.k?'key':'delta',
+      timestamp: header.rt, data: new Uint8Array(e.data, 4+hlen, sz) });
+    st.decoder.decode(chunk);
+  }
+  catch(err){ if(ST[header.s]) ST[header.s].err++; console.error(`[${header.s}] decode sync`, err); }
+  };
+}     // end connect()
+connect();
+
+present();
+</script>

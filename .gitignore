@@ -1,0 +1,34 @@
+# build output
+build/
+cmake-build-*/
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.dSYM/
+
+# OBS source tree clone (SEI-Stamper layout)
+obs-studio-master/
+
+# local dev-only generated/vendored helper dirs (CI supplies these from obs-deps)
+_simde/
+_obscfg/
+
+# obs-plugintemplate build tree / CI download locations
+.deps/
+release/
+build_macos/
+build_x64/
+build_x86_64/
+.ccache/
+
+# IDE / editor
+.idea/
+.vscode/
+*.suo
+*.user
+CMakeLists.txt.user
+
+# misc
+.DS_Store

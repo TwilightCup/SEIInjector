@@ -1,0 +1,9 @@
+package 'cmake'
+package 'ccache'
+package 'git'
+package 'jq'
+package 'ninja-build', bin: 'ninja'
+package 'pkg-config'
+# plugin needs libavcodec/libavutil dev headers on Linux (no obs-deps bundle)
+package 'libavcodec-dev'
+package 'libavutil-dev'
