@@ -32,11 +32,9 @@ typedef struct realtime_clock realtime_clock_t;
  * background re-sync period (minimum 1000). Returns NULL on allocation
  * failure.
  *
- * A single *blocking* initial sync is performed synchronously (bounded by a
- * short socket timeout) so the very first stamped frames already carry an
- * NTP-corrected time; afterwards the worker thread keeps the offset fresh.
- * A failed initial sync never fails the encoder: stamps simply fall back to
- * the local clock until a background sync succeeds.
+ * Initial synchronization runs on the worker, not the caller. Before the
+ * first successful sample, timestamps use local time. DNS/receive never hold
+ * the state mutex. Destroy joins the worker and can still wait for DNS/I/O.
  */
 realtime_clock_t *realtime_clock_create(const char *server, uint16_t port, uint32_t interval_ms);
 
@@ -45,11 +43,14 @@ void realtime_clock_destroy(realtime_clock_t *clock);
 /*
  * Current absolute time in microseconds since the Unix epoch, corrected with
  * the latest NTP offset (or plain local time when NTP is off / not yet
- * synced). Never blocks.
+ * synced). Only briefly locks in-memory state; never waits for network I/O.
  */
 int64_t realtime_clock_now_us(realtime_clock_t *clock);
 
-/* True when the last NTP exchange succeeded (and NTP is enabled). */
+/* Atomically snapshot the offset and its provenance for one submitted frame. */
+int64_t realtime_clock_snapshot(realtime_clock_t *clock, bool *ntp_synced);
+
+/* True once an NTP exchange succeeded; a failed refresh retains the offset. */
 bool realtime_clock_ntp_synced(realtime_clock_t *clock);
 
 /* Last measured offset (server - local) in microseconds. */

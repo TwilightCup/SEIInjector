@@ -143,42 +143,31 @@ front-end acceptance checklist.
 
 ## Building
 
-You build against an OBS source tree (same approach as SEI-Stamper). At the
-top of this repo, either clone OBS into `obs-studio-master` or point CMake at
-an existing one.
+Use CMake **3.28 or newer** and a compatible C compiler (the CI template
+selects C17). Build against the OBS SDK and FFmpeg development libraries for
+the OBS installation you will actually run.
 
-Requirements:
-* CMake ≥ 3.20, a C11 compiler.
-* OBS Studio **sources** (headers + built `libobs`) — version ≥ 31.
-* FFmpeg headers + libs (avcodec, avutil): from OBS's bundled deps
-  (`obs-deps-*`), `pkg-config`/`--enable-libav*`, or Homebrew on macOS.
-
-### Windows (from source, mirroring SEI-Stamper)
-
-```bat
-git clone https://github.com/obsproject/obs-studio.git obs-studio-master
-:: ... build OBS Studio itself (or download a prebuilt dev environment)
-cmake -S . -B build -DOBS_DIR=%CD%\obs-studio-master\build\rundir\Release ^
-                     -DOBS_DEPS_DIR=%CD%\obs-studio-master\.deps\obs-deps-2025-08-23-x64
-cmake --build build --config Release
-cmake --install build
-```
-
-### macOS
+The default `SEI_TIMESTAMP_BOOTSTRAP_OBS=ON` keeps the existing CI/template
+flow: macOS/Windows use the pinned bootstrap dependencies, and Linux uses the
+installed libobs development package. Local builds can use an exported SDK:
 
 ```sh
-# build OBS first (or use an OBS dev prefix) then:
-cmake -S . -B build -DOBS_SOURCE_DIR=/path/obs-studio/libobs \
-                     -DOBS_LIB_DIR=/path/obs-studio/build/libobs \
-                     -Dlibobs_DIR=$(find /path/obs-studio/build -name 'libobsConfig.cmake' -exec dirname {} \;) \
-                     -DFFMPEG_INCLUDE_DIR=/opt/homebrew/include \
-                     -DFFMPEG_LIBRARY_DIR=/opt/homebrew/lib
-cmake --build build
+cmake -S . -B build-local -DSEI_TIMESTAMP_BOOTSTRAP_OBS=OFF \
+  -DOBS_SDK_PREFIX=/path/to/obs-sdk \
+  -DFFMPEG_SDK_PREFIX=/path/to/matching-ffmpeg-sdk
+cmake --build build-local --config RelWithDebInfo
 ```
 
-Link the resulting `sei-timestamp.so` against the OBS-bundled FFmpeg
-dylibs (`@rpath`-based, inside `obs-studio.app`) or statically vendored ones,
-matching how OBS itself links `obs-ffmpeg`.
+`CMAKE_PREFIX_PATH` or `libobs_DIR` can also locate `libobsConfig.cmake`.
+Manual framework/shared-library/import-library discovery is available for
+SDKs without that package; see **[Building and ABI compatibility](docs/BUILDING.md)**
+for macOS, Linux and Windows commands, dependencies and artifact details.
+
+FFmpeg is linked directly. A plugin binary is built and validated for a
+specific OBS/FFmpeg ABI combination; it is **not** compatible with arbitrary
+FFmpeg major versions. `SEI_TIMESTAMP_DYNAMIC_FFMPEG=ON` is rejected during
+configuration. Configure output records dependency sources, and the plugin
+load log records the compiled OBS API and FFmpeg header/runtime versions.
 
 ### Unit tests (no OBS / FFmpeg needed)
 

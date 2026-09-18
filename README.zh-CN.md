@@ -117,39 +117,28 @@ WebSocket 协议 v1（AU+SEI 帧格式、cfg/tick）、备选服务端引擎方�
 
 ## 编译
 
-需要 OBS 源码树（头文件 + 编译好的 libobs）。可把 obs-studio 克隆到本仓库
-顶层 `obs-studio-master/`（与 SEI-Stamper 相同做法），或用 CMake 变量指向
-已有目录。
+需要 CMake **≥ 3.28** 和兼容的 C 编译器（CI 模板选择 C17）。
+请使用与目标 OBS 安装匹配的 libobs SDK 和 FFmpeg 开发库。
 
-依赖：CMake ≥ 3.20、C11 编译器；OBS Studio 源码（≥ 31）；FFmpeg
-头文件与库（avcodec、avutil）——来自 OBS 的 `obs-deps-*`、`pkg-config`，
-或 macOS 上 Homebrew。
-
-### Windows（参考 SEI-Stamper）
-
-```bat
-git clone https://github.com/obsproject/obs-studio.git obs-studio-master
-:: ... 先构建 OBS Studio 本身
-cmake -S . -B build -DOBS_DIR=%CD%\obs-studio-master\build\rundir\Release ^
-                     -DOBS_DEPS_DIR=%CD%\obs-studio-master\.deps\obs-deps-2025-08-23-x64
-cmake --build build --config Release
-cmake --install build
-```
-
-### macOS
+默认 `SEI_TIMESTAMP_BOOTSTRAP_OBS=ON` 保留既有 CI/模板流程：
+macOS/Windows 使用固定的 bootstrap 依赖，Linux 使用已安装的 libobs 开发包。
+本地可使用导出的 SDK：
 
 ```sh
-# 先构建 OBS，或使用 OBS 的开发安装前缀，然后：
-cmake -S . -B build -DOBS_SOURCE_DIR=/path/obs-studio/libobs \
-                     -DOBS_LIB_DIR=/path/obs-studio/build/libobs \
-                     -Dlibobs_DIR=$(find /path/obs-studio/build -name 'libobsConfig.cmake' -exec dirname {} \;) \
-                     -DFFMPEG_INCLUDE_DIR=/opt/homebrew/include \
-                     -DFFMPEG_LIBRARY_DIR=/opt/homebrew/lib
-cmake --build build
+cmake -S . -B build-local -DSEI_TIMESTAMP_BOOTSTRAP_OBS=OFF \
+  -DOBS_SDK_PREFIX=/path/to/obs-sdk \
+  -DFFMPEG_SDK_PREFIX=/path/to/matching-ffmpeg-sdk
+cmake --build build-local --config RelWithDebInfo
 ```
 
-生成的 `sei-timestamp.so` 需链接 OBS 自带的 FFmpeg dylib（`obs-studio.app`
-内、`@rpath` 形式）或随 OBS 一起分发的版本。
+也可通过 `CMAKE_PREFIX_PATH` 或 `libobs_DIR` 定位 `libobsConfig.cmake`。
+没有 CMake package 的 SDK 可走 framework、共享库或 Windows 导入库的手动发现路径。
+三平台命令、依赖要求、产物与兼容边界见 **[构建与 ABI 兼容策略](docs/BUILDING.md)**。
+
+插件直接链接 FFmpeg，按目标 OBS/FFmpeg ABI 组合构建和验证，
+**不承诺单个二进制跨任意 FFmpeg 主版本**。
+`SEI_TIMESTAMP_DYNAMIC_FFMPEG=ON` 会在配置时明确报错。
+配置输出记录依赖来源，插件加载日志记录编译时 OBS API 和 FFmpeg 头文件/运行库版本。
 
 ### 单元测试（不需要 OBS / FFmpeg）
 

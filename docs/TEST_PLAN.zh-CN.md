@@ -4,7 +4,7 @@
 > 自动对齐** 的完整链路的**最小 demo**，验证"导播视角"里多路画面与计时器按
 > `全局对齐时间戳(gts)` 帧锁。不是单元测试，是真实前端+真实推流的端到端联调。
 >
-> 版本：固定 0.1.0（OBS ≥31，构建依赖 OBS 31.1.1）。
+> 版本：固定 0.1.1（OBS ≥31，构建依赖 OBS 31.1.1）。
 
 ---
 
@@ -34,7 +34,7 @@
 
 | 件 | 在仓库? | 作用 | 说明 |
 |---|---|---|---|
-| OBS 插件(0.1.0) | ✅ src/ | 每帧打 SEI | 发送侧 |
+| OBS 插件(0.1.1) | ✅ src/ | 每帧打 SEI | 发送侧 |
 | test-clock.html | ✅ tools/ | UTC 毫秒时钟测试图案 | 视觉对拍 |
 | verify/align 脚本 | ✅ tools/ | 离线检验 SEI 是否写对 | 交叉对拍 |
 | **SEI Gateway** | ✅ tools/sei_gateway.py | RTSP→逐帧(SEI+裸AU)→WS | 需 `pip install websockets` |
@@ -126,7 +126,7 @@ python3 tools/align_streams.py alice.ts bob.ts      # median≤1/2帧, MAD≤1/4
 
 | 指标 | 通过阈值 |
 |---|---|
-| 插件版本/日志 | `sei-timestamp v0.1.0` |
+| 插件版本/日志 | `sei-timestamp v0.1.1` |
 | 推流成功 / 导播页出两路画面 | 在线 |
 | verify_sei 帧间隔 / NTP coverage | ≈1/fps 无空洞 / ≥99% |
 | 任一流显示帧 `realtime` | 恒 ≤ gts（无未来帧） |
@@ -148,7 +148,7 @@ python3 tools/align_streams.py alice.ts bob.ts      # median≤1/2帧, MAD≤1/4
 ---
 
 ## 6. 归档
-各站 OBS 日志(http 0.1.0 行)+NTP 截图；观测者存两路抓录、导播页截图/录像、
+各站 OBS 日志(http 0.1.1 行)+NTP 截图；观测者存两路抓录、导播页截图/录像、
 gateway 日志、align/verify 输出。
 
 ---

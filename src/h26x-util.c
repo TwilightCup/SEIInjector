@@ -283,3 +283,118 @@ uint8_t *h26x_extradata_to_annexb(enum h26x_codec codec, const uint8_t *extradat
 	else
 		return parse_hvcc(extradata, extradata_size, out_size);
 }
+
+unsigned h26x_extradata_length_size(enum h26x_codec codec, const uint8_t *data, size_t size)
+{
+	if (!data || !size || data[0] != 1)
+		return 0;
+	if (codec == H26X_H264 && size >= 7)
+		return (data[4] & 3u) + 1;
+	if (codec == H26X_HEVC && size >= 23)
+		return (data[21] & 3u) + 1;
+	return 0;
+}
+
+static bool valid_packet_nal(enum h26x_codec codec, const uint8_t *nal, size_t size, bool *vcl)
+{
+	if (!size || (nal[0] & 0x80))
+		return false;
+	if (codec == H26X_H264) {
+		unsigned type = nal[0] & 31;
+		if (!type || type >= 24)
+			return false;
+		*vcl |= type >= 1 && type <= 5;
+	} else {
+		if (size < 2 || !(nal[1] & 7))
+			return false;
+		*vcl |= ((nal[0] >> 1) & 63) <= 31;
+	}
+	return true;
+}
+
+static bool valid_lengths(enum h26x_codec codec, const uint8_t *data, size_t size,
+                          unsigned width, size_t *total)
+{
+	if (width < 1 || width > 4)
+		return false;
+	size_t pos = 0;
+	bool vcl = false;
+	*total = 0;
+	while (pos < size) {
+		if (size - pos < width)
+			return false;
+		uint32_t len = 0;
+		for (unsigned j = 0; j < width; ++j)
+			len = (len << 8) | data[pos++];
+		if (len > size - pos || !valid_packet_nal(codec, data + pos, len, &vcl))
+			return false;
+		if (*total > SIZE_MAX - 4 || len > SIZE_MAX - 4 - *total)
+			return false;
+		*total += 4 + (size_t)len;
+		pos += len;
+	}
+	return vcl;
+}
+
+bool h26x_packet_to_annexb(enum h26x_codec codec, const uint8_t *data, size_t size,
+                          unsigned length_size, uint8_t **out, size_t *out_size)
+{
+	*out = NULL;
+	*out_size = 0;
+	if (!data || !size || length_size > 4)
+		return false;
+	bool annex = h26x_has_start_code(data, size), vcl = false;
+	if (annex) {
+		size_t pos = 0;
+		while (pos < size) {
+			size_t sc = 0;
+			size_t at = find_next_start_code(data, size, pos, &sc);
+			if (at != pos) {
+				annex = false;
+				break;
+			}
+			size_t ignored;
+			size_t end = find_next_start_code(data, size, at + sc, &ignored);
+			if (end == SIZE_MAX)
+				end = size;
+			if (!valid_packet_nal(codec, data + at + sc, end - at - sc, &vcl)) {
+				annex = false;
+				break;
+			}
+			pos = end;
+		}
+		annex &= vcl;
+	}
+	size_t total = 0;
+	bool lengths = valid_lengths(codec, data, size, length_size, &total);
+	if (annex && lengths)
+		return false; /* never guess between two valid interpretations */
+	if (annex) {
+		/* Even without avcC/hvcC, reject a packet also parseable as lengths. */
+		for (unsigned w = 1; w <= 4; ++w)
+			if (valid_lengths(codec, data, size, w, &total))
+				return false;
+		*out = malloc(size);
+		if (!*out)
+			return false;
+		memcpy(*out, data, size);
+		*out_size = size;
+		return true;
+	}
+	if (!lengths)
+		return false;
+	uint8_t *buf = malloc(total);
+	if (!buf)
+		return false;
+	size_t pos = 0, written = 0;
+	while (pos < size) {
+		uint32_t len = 0;
+		for (unsigned j = 0; j < length_size; ++j)
+			len = (len << 8) | data[pos++];
+		written += emit_nal(buf + written, data + pos, len);
+		pos += len;
+	}
+	*out = buf;
+	*out_size = written;
+	return true;
+}

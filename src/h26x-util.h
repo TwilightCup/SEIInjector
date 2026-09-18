@@ -23,6 +23,13 @@ enum h26x_codec {
 	H26X_HEVC = 1,
 };
 
+/* Normalize one encoder packet (not extradata). length_size is 1..4 only
+ * when explicitly declared by avcC/hvcC; zero means Annex-B is required.
+ * Reject malformed, ambiguous, and header-only packets. malloc result. */
+bool h26x_packet_to_annexb(enum h26x_codec codec, const uint8_t *data, size_t size,
+                          unsigned length_size, uint8_t **out, size_t *out_size);
+unsigned h26x_extradata_length_size(enum h26x_codec codec, const uint8_t *data, size_t size);
+
 /*
  * Converts an encoder extradata blob into an Annex-B byte stream containing
  * the parameter sets (H.264: SPS+PPS; H.265: VPS+SPS+PPS) ready to be

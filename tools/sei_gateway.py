@@ -8,8 +8,9 @@ and pushes the raw AU + SEI over a WebSocket. The browser director subscribes
 to two streams and verifies they are frame-locked by their realtime stamps.
 
 AU order produced by the plugin is [prefix][SPS/PPS (keyframe only)][SEI][video],
-so this splitter closes each AU at its single video slice NAL -- which is
-order-agnostic and keeps SPS/PPS attached to the IDR that follows.
+so the splitter keeps all slices until the next AU prefix or first slice.
+It supports ordinary progressive H.264 (types 1/5), not FMO/ASO/MVC/field pictures.
+Read chunk boundaries are never treated as AU boundaries.
 
 Front-end contract (trimmed from docs/ARCHITECTURE.zh-CN.md §6):
 
@@ -151,25 +152,59 @@ def _analyze(au):
     return is_key, meta, sps, pps
 
 
-def _first_au_end(buf):
-    """Return byte offset where the first AU ends (after a video slice / IDR /
-    AUD / SPS that starts the next frame), or None if we need more data."""
-    starts = list(find_start_codes(bytes(buf)))
-    if not starts:
+def _first_mb_in_slice(nal):
+    """Decode only the first ue(v); None means more bytes are needed."""
+    rbsp = bytearray()
+    zeros = 0
+    for value in nal[1:]:
+        if zeros >= 2 and value == 3:
+            zeros = 0
+            continue
+        rbsp.append(value)
+        zeros = zeros + 1 if value == 0 else 0
+    bits = len(rbsp) * 8
+    leading = 0
+    while leading < bits and not (rbsp[leading // 8] & (0x80 >> (leading % 8))):
+        leading += 1
+    if leading > 31:
+        raise ValueError("invalid H.264 first_mb_in_slice")
+    if leading == bits or bits < 2 * leading + 1:
         return None
-    buf_len = len(buf)
+    value = 1
+    for pos in range(leading + 1, 2 * leading + 1):
+        value = (value << 1) | ((rbsp[pos // 8] >> (7 - pos % 8)) & 1)
+    return value - 1
+
+
+def _first_au_end(buf):
+    """Keep every slice of a progressive picture; never split on read chunks.
+
+    After VCL, AUD/SEI/parameter sets start the next AU. Without such a
+    prefix, first_mb_in_slice == 0 starts the next ordinary progressive frame.
+    Full H.264 picture-boundary parsing (fields/FMO/ASO/MVC) is not implemented.
+    """
+    starts = list(find_start_codes(bytes(buf)))
+    have_vcl = False
     for idx, (pos, sc) in enumerate(starts):
         ns = pos + sc
-        if ns >= buf_len:
-            break
-        # Close each AU at a video slice (1) or IDR (5). This keeps a keyframe's
-        # AUD/SPS/PPS/SEI attached to the slice that belongs to it. The cap in
-        # split_aus() bounds a pathological run so it can't balloon to gigabytes.
-        if (buf[ns] & 0x1F) in (1, 5):
-            if idx + 1 < len(starts):
-                return starts[idx + 1][0]        # end = start of the next NAL
-            return None                          # boundary is last known NAL: wait
-    return None                                  # no boundary seen yet
+        if ns >= len(buf):
+            return None
+        ntype = buf[ns] & 0x1F
+        if have_vcl and ntype in (6, 7, 8, 9, 14, 15, 16, 17, 18):
+            return pos
+        if ntype in (2, 3, 4, 20, 21):
+            raise ValueError("unsupported partitioned/extended H.264 slice")
+        if ntype in (1, 5):
+            end = starts[idx + 1][0] if idx + 1 < len(starts) else len(buf)
+            first_mb = _first_mb_in_slice(buf[ns:end])
+            if first_mb is None:
+                if idx + 1 < len(starts):
+                    raise ValueError("truncated H.264 slice header")
+                return None
+            if have_vcl and first_mb == 0:
+                return pos
+            have_vcl = True
+    return None
 
 
 def split_aus(stream, au_cap=(8 << 20)):
@@ -186,8 +221,8 @@ def split_aus(stream, au_cap=(8 << 20)):
         buf += chunk
         while True:
             end = _first_au_end(buf)
-            if end is None and len(buf) > au_cap:
-                end = len(buf)   # force-flush an oversized run
+            if (end is None and len(buf) > au_cap) or (end is not None and end > au_cap):
+                raise ValueError("AU exceeds cap without a safe picture boundary")
             if end is None:
                 break
             au = bytes(buf[:end])

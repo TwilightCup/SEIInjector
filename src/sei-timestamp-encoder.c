@@ -24,8 +24,12 @@
 #include "h26x-util.h"
 #include "realtime-clock.h"
 #include "sei-payload.h"
+#include "pts-timeline.h"
+#include "packet-pump.h"
 
 #include <libavcodec/avcodec.h>
+#include <libavutil/buffer.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/error.h>
 #include <libavutil/opt.h>
 #include <libavutil/rational.h>
@@ -100,15 +104,8 @@ static const char *cfg_str(obs_data_t *d, const char *key)
 #define DEFAULT_NTP_INTERVAL_MS 60000
 
 /* ------------------------------------------------------------------ */
-/* per-frame submit-time ring (pts -> epoch us)                        */
+/* per-frame submission tracking (pts -> epoch us)                        */
 /* ------------------------------------------------------------------ */
-
-#define STAMP_PTS_RING_CAP 4096u
-
-struct pts_time_entry {
-	int64_t pts;
-	int64_t epoch_us;
-};
 
 struct stamp_encoder {
 	obs_encoder_t *context;
@@ -133,6 +130,14 @@ struct stamp_encoder {
 	AVCodecContext *codec_context;
 	AVFrame *frame;
 	AVPacket *packet;
+	struct packet_pump output_queue;
+	unsigned nal_length_size;
+
+	/* VAAPI (Linux) path: when wrapping a *-vaapi FFmpeg encoder we own a
+	 * VAAPI device ref here; codec_context->hw_frames_ctx / hw_device_ctx
+	 * hold the refs the codec uses and avcodec_free_context() releases them. */
+	bool vaapi;
+	AVBufferRef *hw_device_ctx;
 
 	/* sequence header / inline parameter sets */
 	uint8_t *extra_data;
@@ -151,10 +156,8 @@ struct stamp_encoder {
 	/* coded frame counter put into SEI */
 	uint64_t frame_seq;
 
-	/* pts -> submit time ring */
-	struct pts_time_entry *pts_ring;
-	size_t pts_ring_len;
-	size_t pts_ring_head;
+	/* Outstanding PTS -> submit-time snapshots; no silent eviction. */
+	struct pts_timeline timeline;
 
 	uint64_t log_counter;
 };
@@ -168,39 +171,17 @@ static const char *codec_display_codec(enum stamp_codec codec)
 	return codec == STAMP_CODEC_H264 ? "h264" : "hevc";
 }
 
-static void put_entry(struct stamp_encoder *enc, int64_t pts, int64_t epoch_us)
+static int codec_send(void *ctx, const AVFrame *frame)
 {
-	if (enc->pts_ring_len >= STAMP_PTS_RING_CAP) {
-		/* drop the oldest; its packet (if still pending) will fall
-		 * back to "now" which is fine for a pathological delay */
-		enc->pts_ring_head = (enc->pts_ring_head + 1) % STAMP_PTS_RING_CAP;
-		enc->pts_ring_len--;
-	}
-	size_t slot = (enc->pts_ring_head + enc->pts_ring_len) % STAMP_PTS_RING_CAP;
-	enc->pts_ring[slot].pts = pts;
-	enc->pts_ring[slot].epoch_us = epoch_us;
-	enc->pts_ring_len++;
+	return avcodec_send_frame(ctx, frame);
 }
 
-/* returns the epoch_us recorded for pts, or -1 */
-static int64_t take_entry(struct stamp_encoder *enc, int64_t pts)
+static int codec_receive(void *ctx, AVPacket *packet)
 {
-	for (size_t i = 0; i < enc->pts_ring_len; i++) {
-		size_t idx = (enc->pts_ring_head + i) % STAMP_PTS_RING_CAP;
-		if (enc->pts_ring[idx].pts == pts) {
-			int64_t us = enc->pts_ring[idx].epoch_us;
-			/* remove entry (shift everything after it) */
-			for (size_t j = i; j + 1 < enc->pts_ring_len; j++) {
-				size_t a = (enc->pts_ring_head + j) % STAMP_PTS_RING_CAP;
-				size_t b = (enc->pts_ring_head + j + 1) % STAMP_PTS_RING_CAP;
-				enc->pts_ring[a] = enc->pts_ring[b];
-			}
-			enc->pts_ring_len--;
-			return us;
-		}
-	}
-	return -1;
+	return avcodec_receive_packet(ctx, packet);
 }
+
+static const struct packet_pump_ops codec_ops = {codec_send, codec_receive};
 
 /* ------------------------------------------------------------------ */
 /* FFmpeg codec discovery & option mapping                             */
@@ -216,13 +197,15 @@ static const struct codec_candidate h264_candidates[] = {
 	{"h264_nvenc", "NVIDIA NVENC"},
 	{"h264_amf", "AMD AMF"},
 	{"h264_qsv", "Intel Quick Sync"},
+	{"h264_vaapi", "Linux VAAPI"},
 	{"h264_videotoolbox", "Apple VideoToolbox"},
 	{"h264_mf", "Windows Media Foundation"},
 };
 
 static const struct codec_candidate hevc_candidates[] = {
 	{"hevc_nvenc", "NVIDIA NVENC"},    {"hevc_amf", "AMD AMF"},
-	{"hevc_qsv", "Intel Quick Sync"},  {"hevc_videotoolbox", "Apple VideoToolbox"},
+	{"hevc_qsv", "Intel Quick Sync"},  {"hevc_vaapi", "Linux VAAPI"},
+	{"hevc_videotoolbox", "Apple VideoToolbox"},
 	{"libx265", "Software (libx265)"},
 };
 
@@ -249,6 +232,13 @@ static const char *pick_default_codec_name(enum stamp_codec codec)
 static bool is_name(const char *haystack, const char *needle)
 {
 	return strstr(haystack, needle) != NULL;
+}
+
+/* true when the underlying FFmpeg encoder is the VAAPI one (h264_vaapi /
+ * hevc_vaapi), which needs a hardware frames context to open at all */
+static bool is_vaapi_codec(const char *codec_name)
+{
+	return codec_name && (strcmp(codec_name, "h264_vaapi") == 0 || strcmp(codec_name, "hevc_vaapi") == 0);
 }
 
 /*
@@ -286,6 +276,9 @@ static const char *map_preset(const char *codec_name, const char *preset)
 		return "balanced";
 	}
 
+	if (is_name(codec_name, "vaapi"))
+		return NULL; /* h264_vaapi/hevc_vaapi have no preset option */
+
 	/* libx264 / qsv / others accept the conventional names directly */
 	if (strcmp(p, "veryfast") == 0 || strcmp(p, "faster") == 0 || strcmp(p, "fast") == 0 ||
 	    strcmp(p, "medium") == 0 || strcmp(p, "slow") == 0 || strcmp(p, "slower") == 0 ||
@@ -293,7 +286,7 @@ static const char *map_preset(const char *codec_name, const char *preset)
 	    strcmp(p, "placebo") == 0)
 		return p;
 
-	/* videotoolbox / mf have no preset option */
+	/* videotoolbox / mf / vaapi have no preset option */
 	return NULL;
 }
 
@@ -309,8 +302,20 @@ static void stamp_encoder_destroy_data(void *data)
 
 	encoder_log(LOG_INFO, enc, "Destroying encoder (seq=%llu)", (unsigned long long)enc->frame_seq);
 
+	/* OBS encode() returns at most one packet and exposes no stop/drain
+	 * delivery callback. Do not invent a NULL-frame callback or emit from destroy. */
+	if (enc->timeline.count || enc->output_queue.count)
+		encoder_log(LOG_WARNING, enc,
+			    "Stop: %zu submissions still pending, %zu encoded packets queued; "
+			    "OBS callback cannot deliver a final flush (queued packets are included in pending count)",
+			    enc->timeline.count, enc->output_queue.count);
+	packet_pump_clear(&enc->output_queue);
 	if (enc->codec_context)
 		avcodec_free_context(&enc->codec_context);
+	/* release our own VAAPI device ref (avcodec_free_context above already
+	 * dropped the frames/device refs the codec context held) */
+	if (enc->hw_device_ctx)
+		av_buffer_unref(&enc->hw_device_ctx);
 	if (enc->frame)
 		av_frame_free(&enc->frame);
 	if (enc->packet)
@@ -321,7 +326,6 @@ static void stamp_encoder_destroy_data(void *data)
 	 * OBS's bfree() (mismatched allocator corrupts the heap). */
 	free(enc->inline_headers);
 	bfree(enc->out_buffer);
-	bfree(enc->pts_ring);
 
 	if (enc->clock)
 		realtime_clock_destroy(enc->clock);
@@ -384,6 +388,14 @@ static void *stamp_encoder_create(obs_data_t *settings, obs_encoder_t *encoder, 
 		return NULL;
 	}
 
+	if (enc->av_codec->id != (codec == STAMP_CODEC_H264 ? AV_CODEC_ID_H264 : AV_CODEC_ID_HEVC)) {
+		encoder_log(LOG_ERROR, enc, "codec_name '%s' does not match selected %s", enc->codec_name,
+			    codec_display_codec(codec));
+		stamp_encoder_destroy_data(enc);
+		return NULL;
+	}
+	encoder_log(LOG_INFO, enc, "Resolved FFmpeg encoder=%s input=CPU NV12 path=%s", enc->av_codec->name,
+		    is_vaapi_codec(enc->codec_name) ? "VAAPI upload" : "software-frame submission");
 	enc->codec_context = avcodec_alloc_context3(enc->av_codec);
 	if (!enc->codec_context) {
 		encoder_log(LOG_ERROR, enc, "avcodec_alloc_context3 failed");
@@ -431,6 +443,78 @@ static void *stamp_encoder_create(obs_data_t *settings, obs_encoder_t *encoder, 
 		encoder_log(LOG_INFO, enc, "encoder takes no preset option ('%s' ignored)", enc->preset);
 
 	char errbuf[128];
+
+	/* VAAPI (Linux only): a *-vaapi FFmpeg encoder refuses to open without a
+	 * hardware device + frames context, and only accepts AV_PIX_FMT_VAAPI as
+	 * its input format. Create a VAAPI device, describe an NV12-sourced VAAPI
+	 * frames pool, switch the codec context over to the hardware pixel format,
+	 * and hand both refs to the codec context so stamp_encoder_encode() can
+	 * upload OBS's NV12 CPU frames into GPU/DRM surfaces before encoding.
+	 * Other encoders (libx264/nvenc/amf/...) keep the software path above and
+	 * are unaffected. */
+	enc->vaapi = is_vaapi_codec(enc->codec_name);
+	if (enc->vaapi) {
+		enum AVHWDeviceType hwtype = av_hwdevice_find_type_by_name("vaapi");
+		if (hwtype == AV_HWDEVICE_TYPE_NONE) {
+			encoder_log(LOG_ERROR, enc,
+				    "VAAPI codec selected but this FFmpeg has no "
+				    "'vaapi' hardware type (is libva installed?)");
+			stamp_encoder_destroy_data(enc);
+			return NULL;
+		}
+
+		AVBufferRef *dev_ref = NULL;
+		int r = av_hwdevice_ctx_create(&dev_ref, hwtype, NULL, NULL, 0);
+		if (r < 0) {
+			av_strerror(r, errbuf, sizeof(errbuf));
+			encoder_log(LOG_ERROR, enc, "VAAPI device create failed: %s (%d)", errbuf, r);
+			stamp_encoder_destroy_data(enc);
+			return NULL;
+		}
+		enc->hw_device_ctx = dev_ref; /* now owned by enc */
+
+		AVBufferRef *frames_ref = av_hwframe_ctx_alloc(enc->hw_device_ctx);
+		if (!frames_ref) {
+			encoder_log(LOG_ERROR, enc, "VAAPI frames context alloc failed");
+			stamp_encoder_destroy_data(enc);
+			return NULL;
+		}
+		AVHWFramesContext *fctx = (AVHWFramesContext *)frames_ref->data;
+		fctx->format = AV_PIX_FMT_VAAPI;
+		fctx->sw_format = AV_PIX_FMT_NV12;
+		fctx->width = (int)enc->width;
+		fctx->height = (int)enc->height;
+		r = av_hwframe_ctx_init(frames_ref);
+		if (r < 0) {
+			av_strerror(r, errbuf, sizeof(errbuf));
+			encoder_log(LOG_ERROR, enc, "VAAPI frames context init failed: %s (%d)", errbuf, r);
+			av_buffer_unref(&frames_ref);
+			stamp_encoder_destroy_data(enc);
+			return NULL;
+		}
+
+		/* B-frames: most VAAPI drivers (AMD/Mesa, older Intel) do not
+		 * support them and the FFmpeg VAAPI encoder fails init outright
+		 * when max_b_frames > 0 on such hardware (OBS itself gates this
+		 * behind a libva device query and defaults to 0). We cannot
+		 * query libva directly, so stay on the safe side. */
+		if (enc->codec_context->max_b_frames > 0) {
+			enc->codec_context->max_b_frames = 0;
+			encoder_log(LOG_WARNING, enc,
+				    "VAAPI: B-frames disabled (not supported by "
+				    "all drivers)");
+		}
+
+		/* hand the frames context to the codec (it now owns that ref) and
+		 * give the codec its own device ref too; the VAAPI encoders only
+		 * accept hardware surfaces as input */
+		enc->codec_context->hw_frames_ctx = frames_ref;
+		enc->codec_context->hw_device_ctx = av_buffer_ref(enc->hw_device_ctx);
+		enc->codec_context->pix_fmt = AV_PIX_FMT_VAAPI;
+		encoder_log(LOG_INFO, enc, "VAAPI hardware context ready (%ux%u NV12 -> VAAPI)", fctx->width,
+			    fctx->height);
+	}
+
 	int ret = avcodec_open2(enc->codec_context, enc->av_codec, NULL);
 
 	if (ret < 0) {
@@ -458,6 +542,10 @@ static void *stamp_encoder_create(obs_data_t *settings, obs_encoder_t *encoder, 
 			    "may not start");
 	}
 
+	enc->nal_length_size = h26x_extradata_length_size(codec == STAMP_CODEC_H264 ? H26X_H264 : H26X_HEVC,
+							enc->extra_data, enc->extra_data_size);
+	encoder_log(LOG_INFO, enc, "Packet contract: validated Annex-B or declared %u-byte NAL lengths",
+		    enc->nal_length_size);
 	/* Annex-B parameter sets for inline keyframe injection */
 	enc->inline_headers = h26x_extradata_to_annexb(codec == STAMP_CODEC_H264 ? H26X_H264 : H26X_HEVC,
 						       enc->extra_data, enc->extra_data_size,
@@ -485,8 +573,6 @@ static void *stamp_encoder_create(obs_data_t *settings, obs_encoder_t *encoder, 
 		else
 			enc->stamping_ntp = true;
 	}
-
-	enc->pts_ring = bmalloc(STAMP_PTS_RING_CAP * sizeof(struct pts_time_entry));
 
 	/* Pre-size the output packet buffer with headroom so its address stays
 	 * stable for OBS (which may hold packet->data while muxing). */
@@ -533,15 +619,30 @@ static bool stamp_encoder_encode(void *data, struct encoder_frame *frame, struct
 	if (dbg)
 		encoder_log(LOG_INFO, enc, "enc post frame_unref");
 
-	if (enc->codec_context->pix_fmt != AV_PIX_FMT_NV12 || !frame->data[0] || !frame->data[1]) {
+	if (enc->vaapi) {
+		/* VAAPI's codec_context->pix_fmt is AV_PIX_FMT_VAAPI; OBS still
+		 * hands us NV12 CPU frames, which we upload into a VAAPI surface. */
+		AVHWFramesContext *fctx = (AVHWFramesContext *)enc->codec_context->hw_frames_ctx->data;
+		if (fctx->sw_format != AV_PIX_FMT_NV12 || !frame->data[0] || !frame->data[1]) {
+			encoder_log(LOG_ERROR, enc, "unexpected input format (expected NV12)");
+			return false;
+		}
+	} else if (enc->codec_context->pix_fmt != AV_PIX_FMT_NV12 || !frame->data[0] || !frame->data[1]) {
 		encoder_log(LOG_ERROR, enc, "unexpected input format (expected NV12)");
 		return false;
 	}
 
-	int64_t submit_us = enc->clock ? realtime_clock_now_us(enc->clock) : realtime_clock_local_now_us();
-	put_entry(enc, frame->pts, submit_us);
+	struct stamp_time submitted = {.pts = frame->pts};
+	submitted.epoch_us = realtime_clock_snapshot(enc->clock, &submitted.ntp);
+	if (!pts_timeline_put(&enc->timeline, submitted)) {
+		encoder_log(LOG_ERROR, enc, "PTS tracking failed: duplicate/full pts=%lld pending=%zu; stopping",
+			    (long long)frame->pts, enc->timeline.count);
+		return false;
+	}
 
-	enc->frame->format = enc->codec_context->pix_fmt;
+	enc->frame->format = enc->vaapi
+				     ? ((AVHWFramesContext *)enc->codec_context->hw_frames_ctx->data)->sw_format
+				     : enc->codec_context->pix_fmt;
 	enc->frame->width = enc->codec_context->width;
 	enc->frame->height = enc->codec_context->height;
 	enc->frame->pts = frame->pts;
@@ -553,30 +654,75 @@ static bool stamp_encoder_encode(void *data, struct encoder_frame *frame, struct
 		encoder_log(LOG_INFO, enc, "enc frame fields set (%ux%u ls=%d/%d)", enc->codec_context->width,
 			    enc->codec_context->height, frame->linesize[0], frame->linesize[1]);
 
-	int ret = avcodec_send_frame(enc->codec_context, enc->frame);
+	int ret;
+	if (enc->vaapi) {
+		/* Upload the OBS-supplied NV12 CPU frame into a VAAPI surface and
+		 * encode the hardware frame (av_hwframe_get_buffer sets the frame's
+		 * hw_frames_ctx, which av_hwframe_transfer_data needs to upload). */
+		AVFrame *hw = av_frame_alloc();
+		if (!hw) {
+			encoder_log(LOG_ERROR, enc, "VAAPI hw frame alloc failed");
+			av_frame_unref(enc->frame);
+			return false;
+		}
+		ret = av_hwframe_get_buffer(enc->codec_context->hw_frames_ctx, hw, 0);
+		if (ret < 0) {
+			av_strerror(ret, errbuf, sizeof(errbuf));
+			encoder_log(LOG_ERROR, enc, "av_hwframe_get_buffer: %s (%d)", errbuf, ret);
+			av_frame_free(&hw);
+			av_frame_unref(enc->frame);
+			return false;
+		}
+		hw->pts = frame->pts;
+		ret = av_hwframe_transfer_data(hw, enc->frame, 0);
+		if (ret < 0) {
+			av_strerror(ret, errbuf, sizeof(errbuf));
+			encoder_log(LOG_ERROR, enc, "av_hwframe_transfer_data: %s (%d)", errbuf, ret);
+			av_frame_free(&hw);
+			av_frame_unref(enc->frame);
+			return false;
+		}
+		ret = packet_pump_submit(&enc->output_queue, &codec_ops, enc->codec_context, hw);
+		av_frame_free(&hw);
+	} else {
+		ret = packet_pump_submit(&enc->output_queue, &codec_ops, enc->codec_context, enc->frame);
+	}
 	if (dbg)
 		encoder_log(LOG_INFO, enc, "enc send_frame ret=%d", ret);
 	av_frame_unref(enc->frame); /* we never attached buffers */
 
 	if (ret < 0) {
 		av_strerror(ret, errbuf, sizeof(errbuf));
-		encoder_log(LOG_ERROR, enc, "avcodec_send_frame: %s (%d)", errbuf, ret);
+		encoder_log(LOG_ERROR, enc, "FFmpeg send/drain failed: %s (%d); queued packets=%zu", errbuf, ret,
+			    enc->output_queue.count);
 		return false;
 	}
 
-	ret = avcodec_receive_packet(enc->codec_context, enc->packet);
-	if (dbg)
-		encoder_log(LOG_INFO, enc, "enc receive_packet ret=%d", ret);
-	if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+	if (!packet_pump_pop(&enc->output_queue, enc->packet))
+		return true;
+
+	struct stamp_time stamp;
+	if (enc->packet->pts == AV_NOPTS_VALUE || !pts_timeline_take(&enc->timeline, enc->packet->pts, &stamp)) {
+		encoder_log(LOG_ERROR, enc,
+			    "PTS lookup miss: encoder=%s pts=%lld dts=%lld pending=%zu; "
+			    "stopping without emitting a fabricated timestamp",
+			    enc->codec_name, (long long)enc->packet->pts, (long long)enc->packet->dts,
+			    enc->timeline.count);
 		av_packet_unref(enc->packet);
-		return true; /* no packet yet: normal */
-	} else if (ret < 0) {
-		av_strerror(ret, errbuf, sizeof(errbuf));
-		encoder_log(LOG_ERROR, enc, "avcodec_receive_packet: %s (%d)", errbuf, ret);
 		return false;
 	}
-
-	*received_packet = true;
+	uint8_t *access_unit = NULL;
+	size_t access_unit_size = 0;
+	if (!h26x_packet_to_annexb(enc->codec == STAMP_CODEC_H264 ? H26X_H264 : H26X_HEVC,
+				 enc->packet->data, enc->packet->size, enc->nal_length_size,
+				 &access_unit, &access_unit_size)) {
+		encoder_log(LOG_ERROR, enc,
+			    "Invalid/ambiguous packet or unsupported NAL framing: encoder=%s pts=%lld size=%d "
+			    "declared_length_size=%u; no SEI emitted",
+			    enc->codec_name, (long long)enc->packet->pts, enc->packet->size, enc->nal_length_size);
+		av_packet_unref(enc->packet);
+		return false;
+	}
 
 	bool keyframe = (enc->packet->flags & AV_PKT_FLAG_KEY) != 0;
 	if (dbg)
@@ -586,14 +732,11 @@ static bool stamp_encoder_encode(void *data, struct encoder_frame *frame, struct
 	sei_ts_frame_info_t info;
 	memset(&info, 0, sizeof(info));
 	info.keyframe = keyframe;
-	info.clock_ntp = enc->stamping_ntp && realtime_clock_ntp_synced(enc->clock);
+	info.clock_ntp = stamp.ntp;
 	info.frame_seq = (uint32_t)enc->frame_seq++;
 	info.media_pts = enc->packet->pts;
 
-	int64_t submit_epoch = take_entry(enc, enc->packet->pts);
-	info.realtime_us = submit_epoch >= 0
-				   ? submit_epoch
-				   : (enc->clock ? realtime_clock_now_us(enc->clock) : realtime_clock_local_now_us());
+	info.realtime_us = stamp.epoch_us;
 
 	uint8_t *sei_nal = NULL;
 	size_t sei_nal_size = 0;
@@ -601,6 +744,7 @@ static bool stamp_encoder_encode(void *data, struct encoder_frame *frame, struct
 							     : H26X_HEVC,
 			      &info, &sei_nal, &sei_nal_size)) {
 		encoder_log(LOG_ERROR, enc, "SEI allocation failed");
+		free(access_unit);
 		av_packet_unref(enc->packet);
 		return false;
 	}
@@ -608,13 +752,13 @@ static bool stamp_encoder_encode(void *data, struct encoder_frame *frame, struct
 		encoder_log(LOG_INFO, enc, "enc SEI built (%zu B)", sei_nal_size);
 
 	/* --- assemble: [prefix][inline hdr][SEI][rest] --------------- */
-	size_t prefix = h26x_prefix_nal_bytes(enc->codec == STAMP_CODEC_H264 ? H26X_H264 : H26X_HEVC, enc->packet->data,
-					      enc->packet->size);
+	size_t prefix = h26x_prefix_nal_bytes(enc->codec == STAMP_CODEC_H264 ? H26X_H264 : H26X_HEVC,
+					      access_unit, access_unit_size);
 	if (dbg)
 		encoder_log(LOG_INFO, enc, "enc prefix=%zu pkt=%d", prefix, (int)enc->packet->size);
 
 	size_t add = sei_nal_size + (keyframe ? enc->inline_headers_size : 0);
-	size_t total = enc->packet->size + add;
+	size_t total = access_unit_size + add;
 
 	/* Reuse one output buffer whose address must stay stable once handed to
 	 * OBS: OBS may hold packet->data asynchronously (interleaved flv/rtmp
@@ -627,7 +771,7 @@ static bool stamp_encoder_encode(void *data, struct encoder_frame *frame, struct
 	sei_trace(enc, "ASSEMBLE add=%zu total=%zu cap=%zu key=%d", add, total, enc->out_buffer_size, keyframe ? 1 : 0);
 
 	size_t o = 0;
-	memcpy(enc->out_buffer, enc->packet->data, prefix);
+	memcpy(enc->out_buffer, access_unit, prefix);
 	o += prefix;
 	sei_trace(enc, "C1 prefix ok o=%zu", o);
 	if (keyframe && enc->inline_headers && enc->inline_headers_size > 0) {
@@ -639,13 +783,15 @@ static bool stamp_encoder_encode(void *data, struct encoder_frame *frame, struct
 	o += sei_nal_size;
 	sei_trace(enc, "C3 sei ok o=%zu", o);
 	sei_trace(enc, "C4 pkt=%p size=%d prefix=%zu o=%zu dst=%p len=%zu", enc->packet->data, (int)enc->packet->size,
-		  prefix, o, (void *)(enc->out_buffer + o), enc->packet->size - prefix);
-	memcpy(enc->out_buffer + o, enc->packet->data + prefix, enc->packet->size - prefix);
+		  prefix, o, (void *)(enc->out_buffer + o), access_unit_size - prefix);
+	memcpy(enc->out_buffer + o, access_unit + prefix, access_unit_size - prefix);
+	free(access_unit);
 	free(sei_nal); /* sei_ts_build_nal() allocates with C malloc */
 	sei_trace(enc, "C4 rest ok total=%zu", total);
 	if (dbg)
 		encoder_log(LOG_INFO, enc, "enc assembled (%zu B)", total);
 
+	*received_packet = true;
 	packet->data = enc->out_buffer;
 	packet->size = total;
 	packet->type = OBS_ENCODER_VIDEO;

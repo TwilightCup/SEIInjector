@@ -21,8 +21,8 @@
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
 #include <winsock2.h>
+#include <windows.h>
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
@@ -137,24 +137,25 @@ typedef struct ntp_ts {
 	uint32_t fraction; /* 2^-32 s */
 } ntp_ts_t;
 
-#ifdef _WIN32
-static bool rtc_winsock_started;
-static void rtc_ensure_winsock(void)
-{
-	if (!rtc_winsock_started) {
-		WSADATA wsa;
-		if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0)
-			rtc_winsock_started = true;
-	}
-}
-#endif
-
 static int64_t ntp_to_epoch_us(const ntp_ts_t *t)
 {
 	uint64_t s = t->seconds;
 	if (s >= NTP_EPOCH_OFFSET)
 		s -= NTP_EPOCH_OFFSET;
 	return (int64_t)(s * 1000000ULL + (((uint64_t)t->fraction * 1000000ULL) >> 32));
+}
+
+/* Four-timestamp SNTP calculation, also tested with deterministic samples. */
+static bool rtc_measurement(int64_t t1, int64_t t2, int64_t t3, int64_t t4,
+                            int64_t *offset, int64_t *rtt)
+{
+	if (t4 < t1 || t3 < t2)
+		return false;
+	*rtt = (t4 - t1) - (t3 - t2);
+	if (*rtt < 0)
+		return false;
+	*offset = ((t2 - t1) + (t3 - t4)) / 2;
+	return true;
 }
 
 /*
@@ -164,10 +165,16 @@ static int64_t ntp_to_epoch_us(const ntp_ts_t *t)
 static bool rtc_sntp_exchange(const char *server, uint16_t port, int64_t *offset_us, int64_t *rtt_us)
 {
 #ifdef _WIN32
-	rtc_ensure_winsock();
+	WSADATA wsa;
+	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+		return false;
 #endif
 
+#ifdef _WIN32
+	SOCKET sock = INVALID_SOCKET;
+#else
 	int sock = -1;
+#endif
 	struct addrinfo *ai = NULL;
 	bool ok = false;
 	char port_str[16];
@@ -180,11 +187,15 @@ static bool rtc_sntp_exchange(const char *server, uint16_t port, int64_t *offset
 
 	if (getaddrinfo(server, port_str, &hints, &ai) != 0 || !ai)
 		goto done;
-	sock = (int)socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+	sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+#ifdef _WIN32
+	if (sock == INVALID_SOCKET)
+#else
 	if (sock < 0)
+#endif
 		goto done;
 
-	/* short timeouts so a dead server can never stall the caller */
+	/* Bound the receive wait; DNS may still delay this worker and destroy(). */
 #ifdef _WIN32
 	DWORD tv = 1200;
 	setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
@@ -211,15 +222,21 @@ static bool rtc_sntp_exchange(const char *server, uint16_t port, int64_t *offset
 	pkt[46] = (uint8_t)(ntp_frac >> 8);
 	pkt[47] = (uint8_t)ntp_frac;
 
-	if (sendto(sock, (const char *)pkt, sizeof(pkt), 0, ai->ai_addr, (socklen_t)ai->ai_addrlen) < 0)
+#ifdef _WIN32
+	int addrlen = (int)ai->ai_addrlen;
+#else
+	socklen_t addrlen = (socklen_t)ai->ai_addrlen;
+#endif
+	if (sendto(sock, (const char *)pkt, sizeof(pkt), 0, ai->ai_addr, addrlen) < 0)
 		goto done;
 
 	uint8_t rsp[NTP_PACKET_SIZE];
-	int64_t t4 = realtime_clock_local_now_us();
 	/* recvfrom returns ssize_t on POSIX but int on Windows; `int` covers both
 	 * and the 48-byte NTP read can never reach the negative range anyway. */
 	int got = (int)recvfrom(sock, (char *)rsp, sizeof(rsp), 0, NULL, NULL);
-	if (got < (int)NTP_PACKET_SIZE)
+	int64_t t4 = realtime_clock_local_now_us();
+	if (got < (int)NTP_PACKET_SIZE || (rsp[0] & 7) != 4 || (rsp[0] >> 6) == 3 ||
+	    rsp[1] == 0 || rsp[1] > 15 || memcmp(rsp + 24, pkt + 40, 8) != 0)
 		goto done;
 
 	ntp_ts_t t2 = {
@@ -232,21 +249,19 @@ static bool rtc_sntp_exchange(const char *server, uint16_t port, int64_t *offset
 	int64_t t1 = local_now;
 	int64_t t2_us = ntp_to_epoch_us(&t2);
 	int64_t t3_us = ntp_to_epoch_us(&t3);
-	/* offset = ((t2 - t1) + (t3 - t4)) / 2 */
-	*offset_us = ((t2_us - t1) + (t3_us - t4)) / 2;
-	*rtt_us = (t4 - t1) - (t3_us - t2_us);
-	ok = true;
+	ok = rtc_measurement(t1, t2_us, t3_us, t4, offset_us, rtt_us);
 
 done:
 	if (ai)
 		freeaddrinfo(ai);
-	if (sock >= 0) {
 #ifdef _WIN32
+	if (sock != INVALID_SOCKET)
 		closesocket(sock);
+	WSACleanup();
 #else
+	if (sock >= 0)
 		close(sock);
 #endif
-	}
 	return ok;
 }
 
@@ -257,7 +272,7 @@ done:
 struct realtime_clock {
 	char server[256];
 	uint16_t port;
-	uint32_t interval_us;
+	uint64_t interval_us;
 
 	rtc_mutex_t lock;
 	int64_t offset_us; /* server - local */
@@ -265,21 +280,32 @@ struct realtime_clock {
 	uint32_t sync_count;
 	uint32_t fail_count;
 
-	volatile bool stop;
+	bool stop; /* protected by lock */
 	rtc_thread_t thread;
 	bool thread_started;
 };
 
-static void rtc_sync_once_locked(realtime_clock_t *c)
+typedef bool (*rtc_exchange_fn)(const char *, uint16_t, int64_t *, int64_t *);
+
+static bool rtc_should_stop(realtime_clock_t *c)
+{
+	rtc_mutex_lock(&c->lock);
+	bool stop = c->stop;
+	rtc_mutex_unlock(&c->lock);
+	return stop;
+}
+
+/* Network work is outside the lock; only publish the completed sample under it. */
+static void rtc_sync_once(realtime_clock_t *c, rtc_exchange_fn exchange)
 {
 	/* take up to three samples and keep the lowest round-trip time */
 	int64_t best_offset = 0;
 	int64_t best_rtt = INT64_MAX;
 	bool any = false;
 
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < 3 && !rtc_should_stop(c); i++) {
 		int64_t off = 0, rtt = 0;
-		if (rtc_sntp_exchange(c->server, c->port, &off, &rtt)) {
+		if (exchange(c->server, c->port, &off, &rtt)) {
 			any = true;
 			if (rtt < best_rtt) {
 				best_rtt = rtt;
@@ -290,6 +316,7 @@ static void rtc_sync_once_locked(realtime_clock_t *c)
 		}
 	}
 
+	rtc_mutex_lock(&c->lock);
 	if (any) {
 		c->offset_us = best_offset;
 		c->ntp_synced = true;
@@ -298,6 +325,7 @@ static void rtc_sync_once_locked(realtime_clock_t *c)
 		c->fail_count++;
 		/* keep the previous offset (may be 0 = local time) */
 	}
+	rtc_mutex_unlock(&c->lock);
 }
 
 #ifdef _WIN32
@@ -309,16 +337,14 @@ static void *rtc_worker(void *arg)
 	realtime_clock_t *c = arg;
 	int64_t next = rtc_mono_us(); /* first sync happens right away */
 
-	while (!c->stop) {
+	while (!rtc_should_stop(c)) {
 		rtc_sleep_ms(200);
 		int64_t now = rtc_mono_us();
 		if (now < next)
 			continue;
 		next = now + c->interval_us;
 
-		rtc_mutex_lock(&c->lock);
-		rtc_sync_once_locked(c);
-		rtc_mutex_unlock(&c->lock);
+		rtc_sync_once(c, rtc_sntp_exchange);
 	}
 
 #ifdef _WIN32
@@ -340,7 +366,7 @@ realtime_clock_t *realtime_clock_create(const char *server, uint16_t port, uint3
 	uint32_t iv = interval_ms ? interval_ms : 60000;
 	if (iv < 1000)
 		iv = 1000;
-	c->interval_us = iv * 1000u;
+	c->interval_us = (uint64_t)iv * 1000u;
 
 	rtc_mutex_init(&c->lock);
 	c->stop = false;
@@ -364,7 +390,9 @@ void realtime_clock_destroy(realtime_clock_t *c)
 	if (!c)
 		return;
 
+	rtc_mutex_lock(&c->lock);
 	c->stop = true;
+	rtc_mutex_unlock(&c->lock);
 	if (c->thread_started)
 		rtc_thread_join(c->thread);
 
@@ -372,17 +400,22 @@ void realtime_clock_destroy(realtime_clock_t *c)
 	free(c);
 }
 
+int64_t realtime_clock_snapshot(realtime_clock_t *c, bool *synced)
+{
+	*synced = false;
+	if (!c || !c->server[0])
+		return realtime_clock_local_now_us();
+	rtc_mutex_lock(&c->lock);
+	int64_t now = realtime_clock_local_now_us() + c->offset_us;
+	*synced = c->ntp_synced;
+	rtc_mutex_unlock(&c->lock);
+	return now;
+}
+
 int64_t realtime_clock_now_us(realtime_clock_t *c)
 {
-	int64_t local = realtime_clock_local_now_us();
-	if (!c || !c->server[0])
-		return local;
-
-	int64_t offset;
-	rtc_mutex_lock(&c->lock);
-	offset = c->offset_us;
-	rtc_mutex_unlock(&c->lock);
-	return local + offset;
+	bool synced;
+	return realtime_clock_snapshot(c, &synced);
 }
 
 bool realtime_clock_ntp_synced(realtime_clock_t *c)
