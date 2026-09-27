@@ -107,27 +107,21 @@ int64_t realtime_clock_local_now_us(void)
 #endif
 }
 
-/* Monotonic microseconds. Never substitute the adjustable wall clock. */
+/* monotonic microseconds (used only for the resync scheduler) */
 static int64_t rtc_mono_us(void)
 {
 #if defined(_WIN32)
 	LARGE_INTEGER freq, cnt;
-	if (QueryPerformanceFrequency(&freq) && freq.QuadPart > 0 && QueryPerformanceCounter(&cnt))
-		return (cnt.QuadPart / freq.QuadPart) * 1000000LL +
-		       (int64_t)((long double)(cnt.QuadPart % freq.QuadPart) * 1000000 / freq.QuadPart);
-	return -1;
+	if (QueryPerformanceFrequency(&freq) && QueryPerformanceCounter(&cnt))
+		return (int64_t)((cnt.QuadPart * 1000000LL) / freq.QuadPart);
+	return realtime_clock_local_now_us();
 #elif defined(CLOCK_MONOTONIC)
 	struct timespec ts;
-	/* Linux MONOTONIC excludes suspend; BOOTTIME keeps freshness honest. */
-#ifdef CLOCK_BOOTTIME
-	if (clock_gettime(CLOCK_BOOTTIME, &ts) == 0)
-#else
 	if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
-#endif
 		return (int64_t)ts.tv_sec * 1000000LL + (int64_t)ts.tv_nsec / 1000LL;
-	return -1;
+	return realtime_clock_local_now_us();
 #else
-	return -1;
+	return realtime_clock_local_now_us();
 #endif
 }
 
@@ -143,57 +137,32 @@ typedef struct ntp_ts {
 	uint32_t fraction; /* 2^-32 s */
 } ntp_ts_t;
 
-/* Unfold the 32-bit seconds into the era nearest the local reference.
- * As with NTP itself, the reference must be within 68 years of true UTC. */
-static int64_t ntp_to_epoch_us(const ntp_ts_t *t, int64_t reference_us)
+static int64_t ntp_to_epoch_us(const ntp_ts_t *t)
 {
-	int64_t reference = reference_us / 1000000LL + (int64_t)NTP_EPOCH_OFFSET;
-	int64_t seconds = (reference & ~0xffffffffLL) + t->seconds;
-	if (seconds - reference > INT32_MAX)
-		seconds -= 0x100000000LL;
-	else if (reference - seconds > INT32_MAX)
-		seconds += 0x100000000LL;
-	return (seconds - (int64_t)NTP_EPOCH_OFFSET) * 1000000LL +
-	       (int64_t)(((uint64_t)t->fraction * 1000000ULL) >> 32);
-}
-
-#define RTC_MAX_RTT_US 250000LL
-#define RTC_MAX_STEP_US 4000000LL
-#define RTC_FRESH_US 180000000LL
-#define RTC_WALL_TOLERANCE_US 50000LL
-#define RTC_SLEW_DIVISOR 50 /* at most +/-2% of elapsed monotonic time */
-
-struct rtc_sample {
-	int64_t utc_us;
-	int64_t mono_us;
-	int64_t rtt_us;
-};
-
-static bool rtc_wall_stable(int64_t t1, int64_t t4, int64_t m1, int64_t m4)
-{
-	if (m1 < 0 || m4 < m1)
-		return false;
-	int64_t difference = (t4 - t1) - (m4 - m1);
-	return difference >= -RTC_WALL_TOLERANCE_US && difference <= RTC_WALL_TOLERANCE_US;
+	uint64_t s = t->seconds;
+	if (s >= NTP_EPOCH_OFFSET)
+		s -= NTP_EPOCH_OFFSET;
+	return (int64_t)(s * 1000000ULL + (((uint64_t)t->fraction * 1000000ULL) >> 32));
 }
 
 /* Four-timestamp SNTP calculation, also tested with deterministic samples. */
-static bool rtc_measurement(int64_t t1, int64_t t2, int64_t t3, int64_t t4, int64_t *offset, int64_t *rtt)
+static bool rtc_measurement(int64_t t1, int64_t t2, int64_t t3, int64_t t4,
+                            int64_t *offset, int64_t *rtt)
 {
 	if (t4 < t1 || t3 < t2)
 		return false;
 	*rtt = (t4 - t1) - (t3 - t2);
-	if (*rtt < 0 || *rtt > RTC_MAX_RTT_US)
+	if (*rtt < 0)
 		return false;
 	*offset = ((t2 - t1) + (t3 - t4)) / 2;
 	return true;
 }
 
 /*
- * One blocking SNTP round trip. UTC and its monotonic receive anchor travel
- * together; a later wall-clock step cannot corrupt sample publication.
+ * One blocking SNTP round trip. Returns true on success; *offset_us receives
+ * (serverTime - localTime) and *rtt_us the round-trip time.
  */
-static bool rtc_sntp_exchange(const char *server, uint16_t port, struct rtc_sample *sample)
+static bool rtc_sntp_exchange(const char *server, uint16_t port, int64_t *offset_us, int64_t *rtt_us)
 {
 #ifdef _WIN32
 	WSADATA wsa;
@@ -240,7 +209,6 @@ static bool rtc_sntp_exchange(const char *server, uint16_t port, struct rtc_samp
 	pkt[0] = (3 << 3) | 3; /* NTP v3 client */
 
 	/* populate transmit timestamp with our (approximate) epoch */
-	int64_t m1 = rtc_mono_us();
 	int64_t local_now = realtime_clock_local_now_us();
 	uint64_t ntp_sec = (uint64_t)(local_now / 1000000LL) + NTP_EPOCH_OFFSET;
 	uint64_t frac_us = (uint64_t)(local_now % 1000000LL);
@@ -267,9 +235,8 @@ static bool rtc_sntp_exchange(const char *server, uint16_t port, struct rtc_samp
 	 * and the 48-byte NTP read can never reach the negative range anyway. */
 	int got = (int)recvfrom(sock, (char *)rsp, sizeof(rsp), 0, NULL, NULL);
 	int64_t t4 = realtime_clock_local_now_us();
-	int64_t m4 = rtc_mono_us();
-	if (got < (int)NTP_PACKET_SIZE || (rsp[0] & 7) != 4 || (rsp[0] >> 6) == 3 || rsp[1] == 0 || rsp[1] > 15 ||
-	    memcmp(rsp + 24, pkt + 40, 8) != 0)
+	if (got < (int)NTP_PACKET_SIZE || (rsp[0] & 7) != 4 || (rsp[0] >> 6) == 3 ||
+	    rsp[1] == 0 || rsp[1] > 15 || memcmp(rsp + 24, pkt + 40, 8) != 0)
 		goto done;
 
 	ntp_ts_t t2 = {
@@ -280,14 +247,9 @@ static bool rtc_sntp_exchange(const char *server, uint16_t port, struct rtc_samp
 		.fraction = ((uint32_t)rsp[44] << 24) | ((uint32_t)rsp[45] << 16) | ((uint32_t)rsp[46] << 8) | rsp[47]};
 
 	int64_t t1 = local_now;
-	if ((!t2.seconds && !t2.fraction) || (!t3.seconds && !t3.fraction) || !rtc_wall_stable(t1, t4, m1, m4))
-		goto done;
-	int64_t t2_us = ntp_to_epoch_us(&t2, t1);
-	int64_t t3_us = ntp_to_epoch_us(&t3, t1);
-	int64_t offset, rtt;
-	ok = rtc_measurement(t1, t2_us, t3_us, t4, &offset, &rtt);
-	if (ok)
-		*sample = (struct rtc_sample){t4 + offset, m4, rtt};
+	int64_t t2_us = ntp_to_epoch_us(&t2);
+	int64_t t3_us = ntp_to_epoch_us(&t3);
+	ok = rtc_measurement(t1, t2_us, t3_us, t4, offset_us, rtt_us);
 
 done:
 	if (ai)
@@ -313,13 +275,7 @@ struct realtime_clock {
 	uint64_t interval_us;
 
 	rtc_mutex_t lock;
-	int64_t offset_us; /* last accepted server - wall sample, diagnostic only */
-	int64_t anchor_us; /* UTC at mono_us, advanced only with monotonic elapsed time */
-	int64_t mono_us;
-	int64_t remaining_us; /* pending slew correction */
-	int64_t last_good_mono_us;
-	bool have_sample;
-	bool warning_pending;
+	int64_t offset_us; /* server - local */
 	bool ntp_synced;
 	uint32_t sync_count;
 	uint32_t fail_count;
@@ -329,7 +285,7 @@ struct realtime_clock {
 	bool thread_started;
 };
 
-typedef bool (*rtc_exchange_fn)(const char *, uint16_t, struct rtc_sample *);
+typedef bool (*rtc_exchange_fn)(const char *, uint16_t, int64_t *, int64_t *);
 
 static bool rtc_should_stop(realtime_clock_t *c)
 {
@@ -339,77 +295,37 @@ static bool rtc_should_stop(realtime_clock_t *c)
 	return stop;
 }
 
-/* Caller holds lock. Missing/regressed monotonic readings freeze the anchor
- * and revoke trust; there is deliberately no wall-clock fallback. */
-static int64_t rtc_advance_locked(realtime_clock_t *c, int64_t mono)
-{
-	if (mono < c->mono_us) {
-		c->warning_pending = true;
-		c->have_sample = c->ntp_synced = false;
-		return c->anchor_us;
-	}
-	int64_t elapsed = mono - c->mono_us;
-	int64_t correction = elapsed / RTC_SLEW_DIVISOR;
-	if (c->remaining_us < 0) {
-		if (correction > -c->remaining_us)
-			correction = -c->remaining_us;
-		correction = -correction;
-	} else if (correction > c->remaining_us) {
-		correction = c->remaining_us;
-	}
-	c->anchor_us += elapsed + correction;
-	c->remaining_us -= correction;
-	c->mono_us = mono;
-	bool was_synced = c->ntp_synced;
-	c->ntp_synced = c->have_sample && mono >= c->last_good_mono_us && mono - c->last_good_mono_us <= RTC_FRESH_US;
-	c->warning_pending |= was_synced && !c->ntp_synced;
-	return c->anchor_us;
-}
-
-static bool rtc_accept_locked(realtime_clock_t *c, const struct rtc_sample *sample, int64_t now)
-{
-	bool forward = now >= c->mono_us;
-	int64_t predicted = rtc_advance_locked(c, now);
-	if (!forward || sample->mono_us < 0 || now < sample->mono_us || now - sample->mono_us > RTC_MAX_RTT_US ||
-	    sample->rtt_us < 0 || sample->rtt_us > RTC_MAX_RTT_US)
-		return false;
-	int64_t error = sample->utc_us + (now - sample->mono_us) - predicted;
-	if (error < -RTC_MAX_STEP_US || error > RTC_MAX_STEP_US)
-		return false;
-	/* Publication never changes anchor_us: subsequent elapsed time pays off
-	 * the correction gradually, including negative corrections. */
-	c->remaining_us = error;
-	c->last_good_mono_us = sample->mono_us;
-	c->have_sample = c->ntp_synced = true;
-	c->warning_pending = false;
-	c->sync_count++;
-	return true;
-}
-
-/* Network work is outside the lock. Rejected samples do not extend freshness. */
+/* Network work is outside the lock; only publish the completed sample under it. */
 static void rtc_sync_once(realtime_clock_t *c, rtc_exchange_fn exchange)
 {
-	bool accepted = false;
+	/* take up to three samples and keep the lowest round-trip time */
+	int64_t best_offset = 0;
+	int64_t best_rtt = INT64_MAX;
+	bool any = false;
+
 	for (int i = 0; i < 3 && !rtc_should_stop(c); i++) {
-		struct rtc_sample sample;
-		if (!exchange(c->server, c->port, &sample))
-			continue;
-		rtc_mutex_lock(&c->lock);
-		int64_t now = rtc_mono_us();
-		accepted = rtc_accept_locked(c, &sample, now);
-		if (accepted)
-			c->offset_us = sample.utc_us + (now - sample.mono_us) - realtime_clock_local_now_us();
-		rtc_mutex_unlock(&c->lock);
-		if (accepted)
-			break;
-		fprintf(stderr, "[SEI clock] rejected stale/outlier NTP sample; continuous holdover\n");
+		int64_t off = 0, rtt = 0;
+		if (exchange(c->server, c->port, &off, &rtt)) {
+			any = true;
+			if (rtt < best_rtt) {
+				best_rtt = rtt;
+				best_offset = off;
+			}
+			if (rtt < 20000) /* 20 ms: good enough, stop early */
+				break;
+		}
 	}
-	if (!accepted) {
-		rtc_mutex_lock(&c->lock);
+
+	rtc_mutex_lock(&c->lock);
+	if (any) {
+		c->offset_us = best_offset;
+		c->ntp_synced = true;
+		c->sync_count++;
+	} else {
 		c->fail_count++;
-		rtc_mutex_unlock(&c->lock);
-		fprintf(stderr, "[SEI clock] NTP refresh failed; freshness will expire, output continues\n");
+		/* keep the previous offset (may be 0 = local time) */
 	}
+	rtc_mutex_unlock(&c->lock);
 }
 
 #ifdef _WIN32
@@ -423,15 +339,7 @@ static void *rtc_worker(void *arg)
 
 	while (!rtc_should_stop(c)) {
 		rtc_sleep_ms(200);
-		rtc_mutex_lock(&c->lock);
 		int64_t now = rtc_mono_us();
-		rtc_advance_locked(c, now);
-		bool lost = c->warning_pending;
-		c->warning_pending = false;
-		rtc_mutex_unlock(&c->lock);
-		if (lost)
-			fprintf(stderr,
-				"[SEI clock] calibration expired/unavailable; output continues with unknown accuracy\n");
 		if (now < next)
 			continue;
 		next = now + c->interval_us;
@@ -460,12 +368,6 @@ realtime_clock_t *realtime_clock_create(const char *server, uint16_t port, uint3
 		iv = 1000;
 	c->interval_us = (uint64_t)iv * 1000u;
 
-	c->mono_us = rtc_mono_us();
-	if (c->mono_us < 0) {
-		free(c);
-		return NULL;
-	}
-	c->anchor_us = realtime_clock_local_now_us();
 	rtc_mutex_init(&c->lock);
 	c->stop = false;
 
@@ -474,7 +376,7 @@ realtime_clock_t *realtime_clock_create(const char *server, uint16_t port, uint3
 		 * 200 ms after encoder start and every interval_us afterwards,
 		 * so a dead NTP server can never stall "Start Streaming". */
 		if (!rtc_thread_start(&c->thread, rtc_worker, c)) {
-			fprintf(stderr, "[SEI clock] NTP worker unavailable; continuous uncalibrated time\n");
+			/* worker thread failed; keep local-time mode */
 		} else {
 			c->thread_started = true;
 		}
@@ -501,10 +403,10 @@ void realtime_clock_destroy(realtime_clock_t *c)
 int64_t realtime_clock_snapshot(realtime_clock_t *c, bool *synced)
 {
 	*synced = false;
-	if (!c)
-		return 0; /* invalid clock, never silently switch back to wall time */
+	if (!c || !c->server[0])
+		return realtime_clock_local_now_us();
 	rtc_mutex_lock(&c->lock);
-	int64_t now = rtc_advance_locked(c, rtc_mono_us());
+	int64_t now = realtime_clock_local_now_us() + c->offset_us;
 	*synced = c->ntp_synced;
 	rtc_mutex_unlock(&c->lock);
 	return now;
@@ -522,7 +424,6 @@ bool realtime_clock_ntp_synced(realtime_clock_t *c)
 		return false;
 	bool synced;
 	rtc_mutex_lock(&c->lock);
-	rtc_advance_locked(c, rtc_mono_us());
 	synced = c->ntp_synced;
 	rtc_mutex_unlock(&c->lock);
 	return synced;
