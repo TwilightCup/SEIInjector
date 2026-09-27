@@ -562,17 +562,16 @@ static void *stamp_encoder_create(obs_data_t *settings, obs_encoder_t *encoder, 
 	/* realtime clock + NTP */
 	bool ntp_enabled = obs_data_get_bool(settings, SET_NTP_ENABLED);
 	const char *ntp_server = cfg_str(settings, SET_NTP_SERVER);
-	if (ntp_enabled && ntp_server && *ntp_server) {
-		uint16_t port = (uint16_t)obs_data_get_int(settings, SET_NTP_PORT);
-		uint32_t interval = (uint32_t)obs_data_get_int(settings, SET_NTP_INTERVAL);
-		enc->clock = realtime_clock_create(ntp_server, port, interval);
-		if (!enc->clock)
-			encoder_log(LOG_WARNING, enc,
-				    "could not start NTP clock; using local "
-				    "wall clock");
-		else
-			enc->stamping_ntp = true;
+	uint16_t port = (uint16_t)obs_data_get_int(settings, SET_NTP_PORT);
+	uint32_t interval = (uint32_t)obs_data_get_int(settings, SET_NTP_INTERVAL);
+	/* Even without NTP, anchor once and advance with monotonic time. */
+	enc->clock = realtime_clock_create(ntp_enabled ? ntp_server : "", port, interval);
+	if (!enc->clock) {
+		encoder_log(LOG_ERROR, enc, "could not initialize monotonic UTC clock");
+		stamp_encoder_destroy_data(enc);
+		return NULL;
 	}
+	enc->stamping_ntp = ntp_enabled && ntp_server && *ntp_server;
 
 	/* Pre-size the output packet buffer with headroom so its address stays
 	 * stable for OBS (which may hold packet->data while muxing). */
